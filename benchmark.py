@@ -202,8 +202,6 @@ def benchmark_corope_fwd_flops(
 if __name__ == "__main__":
     print("Running CoRoPE Forward + Backward Benchmark")
     benchmark_corope_fwd_flops()
-    
-    print("\n" + "="*80)
-    print("Running CoRoPE Backward Only Benchmark")
-    benchmark_corope_backward_only()
+
+ 
  

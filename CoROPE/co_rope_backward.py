@@ -1,217 +1,211 @@
+import torch
 import triton
 import triton.language as tl
-import torch
+
 
 @triton.jit
 def co_rope_bwd_kernel(
-    Q, K, V, O, M, L, a_k_out,  # forward inputs/outputs
-    dO,                # gradient w.r.t. output
-    dQ, dK, dV, dThetas,        # gradients to compute
+    Q,
+    K,
+    V,
+    O,
+    M,
+    L,
+    A,
+    DO,
+    DQ,
+    DV,  # dv 全局 buffer
+    DK,  # 新增 dk 全局 buffer
+    stride_batch,
+    stride_head,
+    stride_seq,
+    stride_dim,
+    stride_a,
     thetas,
-    stride_batch, stride_head, stride_seq, stride_dim,
-    seq_len: tl.constexpr,
+    seq_len,
     SM_SCALE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NUM_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     CAUSAL: tl.constexpr,
-    CAUSAL_MASK_VALUE: tl.constexpr,
 ):
     m_idx = tl.program_id(axis=0)
     batch_head_idx = tl.program_id(axis=1)
-    bid = batch_head_idx // NUM_HEADS
-    hid = batch_head_idx % NUM_HEADS
 
-    # Compute offsets
     qkv_offset = batch_head_idx.to(tl.int64) * stride_head
+
     Q_base = Q + qkv_offset
     K_base = K + qkv_offset
     V_base = V + qkv_offset
-    dQ_base = dQ + qkv_offset
-    dK_base = dK + qkv_offset
-    dV_base = dV + qkv_offset
     O_base = O + qkv_offset
-    dO_base = dO + qkv_offset
-    a_k_ptr = a_k_out + batch_head_idx * seq_len
+    DO_base = DO + qkv_offset
+    DQ_base = DQ + qkv_offset
+    DV_base = DV + qkv_offset
+    DK_base = DK + qkv_offset  # 新增 DK_base
 
-    offs_m = m_idx
-    mask_m = offs_m < seq_len
+    # [D]
+    thetas = tl.load(thetas + tl.arange(0, HEAD_DIM)).to(tl.float32)
+    swap_offsets = ((tl.arange(0, HEAD_DIM) + 1) % 2) * 2 - 1
 
-    # Load q, k, v, o, do for this position
-    q_ptrs = Q_base + offs_m * stride_seq + tl.arange(0, HEAD_DIM)
-    k_ptrs = K_base + offs_m * stride_seq + tl.arange(0, HEAD_DIM)
-    v_ptrs = V_base + offs_m * stride_seq + tl.arange(0, HEAD_DIM)
-    o_ptrs = O_base + offs_m * stride_seq + tl.arange(0, HEAD_DIM)
-    do_ptrs = dO_base + offs_m * stride_seq + tl.arange(0, HEAD_DIM)
+    # [D]
+    q_ptrs = Q_base + m_idx * stride_seq + tl.arange(0, HEAD_DIM)
+    q = tl.load(q_ptrs).to(tl.float32)
+    o_ptrs = O_base + m_idx * stride_seq + tl.arange(0, HEAD_DIM)
+    o = tl.load(o_ptrs).to(tl.float32)
+    do_ptrs = DO_base + m_idx * stride_seq + tl.arange(0, HEAD_DIM)
+    do = tl.load(do_ptrs).to(tl.float32)
+    m_ptrs = M + batch_head_idx * seq_len + m_idx
+    m = tl.load(m_ptrs)
+    l_ptrs = L + batch_head_idx * seq_len + m_idx
+    l = tl.load(l_ptrs)
+    a_ptrs = A + batch_head_idx * stride_a + m_idx
+    a_total = tl.load(a_ptrs)
+    a_acc = 0.0
+    dq_acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
 
-    q = tl.load(q_ptrs, mask=mask_m, other=0.0).to(tl.float32)
-    k = tl.load(k_ptrs, mask=mask_m, other=0.0).to(tl.float32)
-    v = tl.load(v_ptrs, mask=mask_m, other=0.0).to(tl.float32)
-    o = tl.load(o_ptrs, mask=mask_m, other=0.0).to(tl.float32)
-    do = tl.load(do_ptrs, mask=mask_m, other=0.0).to(tl.float32)
-
-    # Load thetas for this head
-    theta_ptr = thetas + hid * HEAD_DIM + tl.arange(0, HEAD_DIM)
-    theta_this_head = tl.load(theta_ptr).to(tl.float32)
-
-    # Load a_k values for this query
-    a_k_vals = tl.load(a_k_ptr + tl.arange(0, seq_len))  # [seq_len]
-
-    # Initialize gradients
-    dq = tl.zeros([HEAD_DIM], dtype=tl.float32)
-    dk = tl.zeros([HEAD_DIM], dtype=tl.float32)
-    dv = tl.zeros([HEAD_DIM], dtype=tl.float32)
-    dtheta = tl.zeros([HEAD_DIM], dtype=tl.float32)
-
-    # Compute rotary embeddings for q
-    a_k_last = tl.load(a_k_ptr + (seq_len - 1))
-    freqs_q = a_k_last * theta_this_head
-    freqs_cos_q = tl.cos(freqs_q)
-    freqs_sin_q = tl.sin(freqs_q)
-
-    idx = tl.arange(0, HEAD_DIM)
-    even_mask = (idx % 2 == 0)[None, :]
-    odd_mask = (idx % 2 == 1)[None, :]
-    swap_offsets = idx + 1
-    swap_mask = swap_offsets < HEAD_DIM
-
-    q_rot = (
-        even_mask * (freqs_cos_q * q - freqs_sin_q * tl.load(q_ptrs + swap_offsets, mask=swap_mask, other=0.0))
-        + odd_mask * (freqs_sin_q * tl.load(q_ptrs + swap_offsets, mask=swap_mask, other=0.0) + freqs_cos_q * q)
-    )
-
-    # Process blocks for attention computation
-    for start_n in tl.range(0, seq_len, BLOCK_N):
+    for start_n in tl.range(0, m_idx, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
         offs_n = start_n + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < seq_len
-
-        k_ptrs_block = K_base + offs_n[:, None] * stride_seq + tl.arange(0, HEAD_DIM)[None, :]
-        v_ptrs_block = V_base + offs_n[:, None] * stride_seq + tl.arange(0, HEAD_DIM)[None, :]
-        k_block = tl.load(k_ptrs_block, mask=mask_n[:, None], other=0.0).to(tl.float32)
-        v_block = tl.load(v_ptrs_block, mask=mask_n[:, None], other=0.0)
-
-        # Compute rotary embeddings for k
-        a_k_block = tl.load(a_k_ptr + offs_n)  # [BLOCK_N]
-        freqs_k = a_k_block[:, None] * theta_this_head[None, :]
-        freqs_cos_k = tl.cos(freqs_k)
-        freqs_sin_k = tl.sin(freqs_k)
-
-        k_rot = (
-            even_mask * (freqs_cos_k * k_block - freqs_sin_k * tl.load(k_ptrs_block + swap_offsets[None, :], mask=mask_n[:, None] & swap_mask[None, :], other=0.0))
-            + odd_mask * (freqs_sin_k * tl.load(k_ptrs_block + swap_offsets[None, :], mask=mask_n[:, None] & swap_mask[None, :], other=0.0) + freqs_cos_k * k_block)
+        mask_n = offs_n <= m_idx
+        k_ptrs = K_base + offs_n[:, None] * stride_seq + tl.arange(0, HEAD_DIM)[None, :]
+        k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0).to(tl.float32)
+        k_swap = tl.load(k_ptrs + swap_offsets[None, :], mask=mask_n[:, None], other=0.0).to(tl.float32)
+        v_ptrs = V_base + offs_n[:, None] * stride_seq + tl.arange(0, HEAD_DIM)[None, :]
+        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0).to(tl.float32)
+        z = tl.sigmoid(tl.sum(q * k, axis=1))
+        z = tl.where(mask_n, z, 0)
+        zc = tl.cumsum(z)
+        a = zc - a_total
+        freqs = a[:, None] * thetas[None, :]
+        freqs_cos = tl.cos(freqs)
+        freqs_sin = tl.sin(freqs)
+        even_mask = (tl.arange(0, HEAD_DIM) % 2 == 0)[None, :]
+        odd_mask = (tl.arange(0, HEAD_DIM) % 2 == 1)[None, :]
+        rot_k = (
+            even_mask * (freqs_cos * k + freqs_sin * k_swap)
+            + odd_mask * (-freqs_sin * k_swap + freqs_cos * k)
         )
+        qk = tl.sum(q[None, :] * rot_k, axis=1) * SM_SCALE
+        p = tl.exp(qk - m) / l
+        dp = tl.sum(do[None, :] * v, axis=1)
+        ds = p * (dp - tl.sum(do * o))
+        dq_acc += tl.sum(ds[:, None] * rot_k, axis=0) * SM_SCALE
+        drot_k = ds[:, None] * q[None, :]
+        dr = tl.div_rn(drot_k, tl.where(k != 0, k, float('inf')))
+        dr_swap = tl.div_rn(drot_k, tl.where(k_swap != 0, k_swap, float('inf')))
+        dr_cos = dr
+        dr_sin = dr_swap * tl.where(tl.arange(0, HEAD_DIM) % 2 == 0, -1, 1)
+        dfreqs = -tl.sin(dr_cos) + tl.cos(dr_sin)
+        da = tl.sum(dfreqs * thetas[None, :], axis=1)
+        a_acc = a_acc + tl.sum(da)
+        dz = a_acc - tl.cumsum(da, reverse=True)
+        dq_acc += tl.sum(dz[:, None] * k, axis=0)
+        # dv 累加（向量化 atomic_add）
+        dv_ptrs = DV_base + offs_n[:, None] * stride_seq + tl.arange(0, HEAD_DIM)[None, :]
+        dv_update = p[:, None] * do[None, :]
+        tl.atomic_add(dv_ptrs, dv_update, mask=mask_n[:, None])
+        dk_ptrs = DK_base + offs_n[:, None] * stride_seq + tl.arange(0, HEAD_DIM)[None, :]
+        dk_update = ds[:, None] * q[None, :]  # q 已经是当前 query 的
+        tl.atomic_add(dk_ptrs, dk_update, mask=mask_n[:, None])
 
-        # Compute attention logits
-        logits = tl.sum(q_rot * k_rot, axis=1) * SM_SCALE
+    dq_ptrs = DQ_base + m_idx * stride_seq + tl.arange(0, HEAD_DIM)
+    tl.store(dq_ptrs, dq_acc.to(DQ.dtype.element_ty))
 
-        # Apply causal mask if needed
-        if CAUSAL:
-            causal_mask = offs_m >= offs_n
-            attn_mask = causal_mask & mask_n
-        else:
-            attn_mask = mask_n
 
-        logits = tl.where(attn_mask, logits, CAUSAL_MASK_VALUE)
+def co_rope_backward(saved, do, sm_scale=None, theta=10000.0):
+    """
+    Co-RoPE attention 反向传播函数
 
-        # Compute attention weights (softmax)
-        m_max = tl.max(logits, axis=0)
-        logits_stable = logits - m_max
-        exp_logits = tl.exp(logits_stable)
-        sum_exp = tl.sum(exp_logits, axis=0)
-        attention_weights = exp_logits / sum_exp
+    Args:
+        saved: 前向传播保存的张量元组
+        do: 输出的梯度张量
+        sm_scale: 缩放因子，应与前向传播保持一致
 
-        # Gradient computation for attention weights
-        # ∂L/∂attention_weights = do * v
-        d_attention = do * v_block  # [BLOCK_N, HEAD_DIM]
+    Returns:
+        dq, dk, dv: 输入张量 q, k, v 的梯度
+    """
+    # 从上下文中恢复保存的张量
+    q, k, v, o, m, l, a = saved
 
-        # Simplified gradient for logits (diagonal only)
-        d_logits = tl.sum(d_attention, axis=1) * attention_weights * (1 - attention_weights)
-
-        # Gradient for q_rot and k_rot
-        # ∂L/∂q_rot = ∂L/∂logits * k_rot
-        # ∂L/∂k_rot = ∂L/∂logits * q_rot
-        dq_rot = tl.sum(d_logits[:, None] * k_rot, axis=0)
-        dk_rot = d_logits[:, None] * q_rot[None, :]
-
-        # Gradient for q (unrotate)
-        # ∂L/∂q = ∂L/∂q_rot * ∂q_rot/∂q
-        dq += dq_rot * (even_mask * freqs_cos_q - odd_mask * freqs_sin_q + 
-                        even_mask * freqs_sin_q + odd_mask * freqs_cos_q)
-
-        # Gradient for k (unrotate)
-        # ∂L/∂k = ∂L/∂k_rot * ∂k_rot/∂k
-        dk_unrot = dk_rot * (even_mask * freqs_cos_k - odd_mask * freqs_sin_k + 
-                             even_mask * freqs_sin_k + odd_mask * freqs_cos_k)
-        
-        # Accumulate dk for all positions
-        dk += tl.sum(dk_unrot * mask_n[:, None], axis=0)
-
-        # Gradient for v
-        # ∂L/∂v = ∂L/∂attention * attention_weights
-        dv += tl.sum(d_attention * attention_weights[:, None], axis=0)
-
-        # Gradient for thetas
-        # ∂L/∂theta = ∂L/∂q_rot * ∂q_rot/∂theta + ∂L/∂k_rot * ∂k_rot/∂theta
-        dtheta_q = dq_rot * q * a_k_last * (-even_mask * freqs_sin_q - odd_mask * freqs_cos_q + 
-                                            even_mask * freqs_cos_q - odd_mask * freqs_sin_q)
-        dtheta += dtheta_q
-
-        # For k rotations
-        # Compute dtheta_k for all i in the block
-        dtheta_k = dk_rot * k_block * a_k_block[:, None] * (
-            -even_mask * freqs_sin_k - odd_mask * freqs_cos_k +
-            even_mask * freqs_cos_k - odd_mask * freqs_sin_k
-        )  # shape: [BLOCK_N, HEAD_DIM]
-
-        # Mask out invalid rows and sum
-        dtheta += tl.sum(dtheta_k * mask_n[:, None], axis=0)
-
-    # Store gradients
-    tl.store(dQ_base + offs_m * stride_seq + tl.arange(0, HEAD_DIM), dq, mask=mask_m)
-    tl.store(dK_base + offs_m * stride_seq + tl.arange(0, HEAD_DIM), dk, mask=mask_m)
-    tl.store(dV_base + offs_m * stride_seq + tl.arange(0, HEAD_DIM), dv, mask=mask_m)
-
-    if m_idx == 0:  
-        dtheta_ptr = dThetas + hid * HEAD_DIM + tl.arange(0, HEAD_DIM)
-        tl.store(dtheta_ptr, dtheta)
-
-def co_rope_backward(q, k, v, o, m, l, a_k_out, do, thetas, causal, sm_scale):
     batch_size, num_heads, seq_len, head_dim = q.shape
 
-    dq = torch.empty_like(q)
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(v)
-    dthetas = torch.zeros_like(thetas)
+    # 使用传入的 sm_scale，如果没有则使用默认值
+    if sm_scale is None:
+        sm_scale = 1.0 / (head_dim**0.5)
 
-    def grid(meta):
-        return (seq_len, batch_size * num_heads)
+    # 初始化梯度张量
+    dq = torch.zeros_like(q)
+    dk = torch.zeros_like(k)
+    dv = torch.zeros_like(v)
 
-    co_rope_bwd_kernel[grid](
+    thetas = 1.0 / (
+        theta ** (torch.arange(0, head_dim, 2, device=q.device).float() / head_dim)
+    )
+    thetas = thetas.repeat_interleave(2)
+
+    # 确保张量在 CUDA 上
+    assert q.is_cuda and k.is_cuda and v.is_cuda, "输入张量必须是 CUDA 张量"
+
+    # 网格配置
+    def grid_q(meta):
+        return (triton.cdiv(seq_len, meta["BLOCK_M"]), batch_size * num_heads)
+
+    def grid_kv(meta):
+        return (triton.cdiv(seq_len, meta["BLOCK_N"]), batch_size * num_heads)
+
+    # 启动 DQ/DV 计算 kernel
+    co_rope_bwd_kernel.run(
+        grid=grid_q,
+        warmup=False,
         Q=q.contiguous(),
         K=k.contiguous(),
         V=v.contiguous(),
         O=o.contiguous(),
         M=m.contiguous(),
         L=l.contiguous(),
-        a_k_out=a_k_out.contiguous(),
-        dO=do.contiguous(),
-        dQ=dq,
-        dK=dk,
-        dV=dv,
-        dThetas=dthetas,
-        thetas=thetas,
+        A=a.contiguous(),
+        DO=do.contiguous(),
+        DQ=dq.contiguous(),
+        DV=dv.contiguous(),
+        DK=dk.contiguous(),  # 新增
         stride_batch=q.stride(0),
         stride_head=q.stride(1),
         stride_seq=q.stride(2),
         stride_dim=q.stride(3),
+        stride_a=a.stride(1),
+        thetas=thetas,
         seq_len=seq_len,
         SM_SCALE=sm_scale,
         BLOCK_M=1,
-        BLOCK_N=64,
+        BLOCK_N=32,
         NUM_HEADS=num_heads,
         HEAD_DIM=head_dim,
-        CAUSAL=causal,
-        CAUSAL_MASK_VALUE=-torch.finfo(torch.float32).max,
+        CAUSAL=True,
     )
-    return dq, dk, dv, dthetas
+
+    # # 启动 DK, DV 计算 kernel
+    # co_rope_bwd_kv_kernel[grid_kv](
+    #     Q=q.contiguous(),
+    #     K=k.contiguous(),
+    #     V=v.contiguous(),
+    #     O=o.contiguous(),
+    #     M=m.contiguous(),
+    #     L=l.contiguous(),
+    #     DO=do.contiguous(),
+    #     DK=dk,
+    #     DV=dv,
+    #     stride_batch=q.stride(0),
+    #     stride_head=q.stride(1),
+    #     stride_seq=q.stride(2),
+    #     stride_dim=q.stride(3),
+    #     seq_len=seq_len,
+    #     SM_SCALE=sm_scale,
+    #     BLOCK_M=32,
+    #     BLOCK_N=32,
+    #     NUM_HEADS=num_heads,
+    #     HEAD_DIM=head_dim,
+    #     CAUSAL=True,
+    # )
+
+    return dq, dk, dv

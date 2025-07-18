@@ -1,3 +1,4 @@
+
 import torch
 import triton
 import triton.language as tl
@@ -11,11 +12,13 @@ def co_rope_fwd_kernel(
     O,
     M,
     L,
+    A,
     thetas,
     stride_batch,
     stride_head,
     stride_seq,
     stride_dim,
+    stride_a,
     seq_len,
     SM_SCALE: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -55,6 +58,7 @@ def co_rope_fwd_kernel(
     for start_n in tl.range(LAST_BLOCK_START, -1, -BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
 
+        # [N]
         offs_n = start_n + tl.arange(0, BLOCK_N)
         mask_n = offs_n <= m_idx
 
@@ -68,38 +72,25 @@ def co_rope_fwd_kernel(
         # [N]
         zc = tl.cumsum(z)
         zs = tl.sum(z)
-        a = -(a_acc + zs - zc)
+        a = a_acc + zs - zc
+
         # [M]
         a_acc = a_acc + zs # a[0, :]
 
-        # [N, D]
+        # [N, D] = [N, 1] [1, D]
         freqs = a[:, None] * thetas[None, :]
         freqs_cos = tl.cos(freqs)
-        freqs_sin = tl.sin(freqs)
+        freqs_sin = tl.sin(freqs) * tl.where(tl.arange(0, HEAD_DIM) % 2 == 0, -1, 1)
 
         # [N, D]
-        even_mask = (tl.arange(0, HEAD_DIM) % 2 == 0)[None, :]
-        odd_mask = (tl.arange(0, HEAD_DIM) % 2 == 1)[None, :]
-
-        # [N, D]
-        rot = (
-            even_mask * (freqs_cos * q - freqs_sin * q_swap)
-            + odd_mask * (freqs_sin * q_swap + freqs_cos * q)
-        )
+        rot_q = freqs_cos * q + freqs_sin * q_swap
 
         # [N]
-        logits = tl.sum(rot * k, axis=1) * SM_SCALE
+        logits = tl.where(offs_n <= m_idx, tl.sum(rot_q * k, axis=1) * SM_SCALE, CAUSAL_MASK_VALUE)
+
         # [N, D]
         v_ptrs = V_base + offs_n[:, None] * stride_seq + tl.arange(0, HEAD_DIM)[None, :]
         v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0).to(tl.float32)
-
-        if CAUSAL:
-            causal_mask = offs_m >= offs_n  # [BLOCK_N]
-            attn_mask = causal_mask & mask_n
-        else:
-            attn_mask = mask_n
-
-        logits = tl.where(attn_mask, logits, CAUSAL_MASK_VALUE)
 
         # [M]
         m_new = tl.maximum(m_acc, tl.max(logits))
@@ -125,6 +116,9 @@ def co_rope_fwd_kernel(
     l_ptrs = L + batch_head_idx * seq_len + offs_m
     tl.store(l_ptrs, l_acc, mask=mask_m)
 
+    a_ptrs = A + batch_head_idx.to(tl.int64) * stride_a + m_idx
+    tl.store(a_ptrs[None], a_acc)
+
 
 def co_rope_forward(q, k, v, sm_scale, causal=True, theta=10000.0):
     batch_size, num_heads, seq_len, head_dim = q.shape
@@ -145,6 +139,9 @@ def co_rope_forward(q, k, v, sm_scale, causal=True, theta=10000.0):
     l = torch.empty(
         (batch_size, num_heads, seq_len), device=q.device, dtype=torch.float32
     )
+    a = torch.empty(
+        (batch_size, num_heads, seq_len), device=q.device, dtype=torch.float32
+    )
 
     def grid(meta):
         return (triton.cdiv(seq_len, meta["BLOCK_M"]), batch_size * num_heads)
@@ -156,18 +153,26 @@ def co_rope_forward(q, k, v, sm_scale, causal=True, theta=10000.0):
         O=o,
         M=m,
         L=l,
+        A=a,
         thetas=thetas,
         stride_batch=q.stride(0),
         stride_head=q.stride(1),
         stride_seq=q.stride(2),
         stride_dim=q.stride(3),
+        stride_a=a.stride(1),
         seq_len=seq_len,
         SM_SCALE=sm_scale,
         BLOCK_M=1,
-        BLOCK_N=8,
+        BLOCK_N=32,
         NUM_HEADS=num_heads,
         HEAD_DIM=head_dim,
         CAUSAL=causal,
         CAUSAL_MASK_VALUE=-torch.finfo(torch.float32).max,
     )
-    return (q, k, v, o, m, l), o
+    # if os.getenv('COALIBI_VERBOSE', '0') == '1':
+    #     try:
+    #         best_cfg = _co_alibi_fwd_kernel.get_best_config()
+    #         print(f"[Co-ALIBI] Original kernel best config: {best_cfg.kwargs}, num_warps={best_cfg.num_warps}, num_stages={best_cfg.num_stages}")
+    #     except Exception as _e:
+    #         pass
+    return (q, k, v, o, m, l, a), o

@@ -2,10 +2,19 @@ import torch
 import math
 
 from CoROPE.forward import co_rope_forward
-#from CoROPE.co_rope_backward import co_rope_backward
+from CoROPE.co_rope_backward import co_rope_backward
 from rope_utils import precompute_rope_freqs, apply_rope_torch
+
+import torch
+import math
+
+# import warnings
+# warnings.filterwarnings('error', category=RuntimeWarning)
+
 def print_red_warning(message):
     print(f"\033[31mERROR: {message}\033[0m")
+
+
 def calc_sim(x, y, name="tensor"):
     x, y = x.data.double(), y.data.double()
     denominator = (x * x + y * y).sum()
@@ -14,6 +23,7 @@ def calc_sim(x, y, name="tensor"):
         return 1
     sim = 2 * (x * y).sum() / denominator
     return sim
+
 
 def assert_similar(x, y, eps=1e-8, name="tensor", assert_=False, print_=True):
     """正确标准：
@@ -76,65 +86,21 @@ def forward_reference(q, k, v, sm_scale, theta=10000.0):
     for b in range(batch_num):
         for h in range(head_num):
             for t in range(seq_len):
+                # [D]
+                q_rot = apply_rotary(q[b, h, t, :], a[b, h, t, t]).unsqueeze(0)
                 # [T, D]
-                q_rot = apply_rotary(q[b, h, t, :].unsqueeze(0).expand(seq_len, -1), a[b, h, t, :] - a[b, h, t, t])
-                # [T, D]
-                # k_rot = apply_rotary(k[b, h, :, :], a[b, h, t, :])
-                k_rot = k[b, h, :, :]
+                k_rot = apply_rotary(k[b, h, :, :], a[b, h, t, :])
                 # [T]
                 causal_mask = torch.arange(0, seq_len, device=q.device) <= t
-                logits = torch.sum(k_rot * q_rot, dim=-1) * causal_mask * sm_scale
-                logits = logits.masked_fill(causal_mask == 0, float('-inf'))
-                w[b, h, t, :] = torch.softmax(logits, dim=-1)
+                logits = torch.where(causal_mask, torch.sum(k_rot * q_rot, dim=-1) * sm_scale, float('-inf'))
 
+                # [T]
+                w[b, h, t, :] = torch.softmax(logits, dim=0)
 
+    # [B, H, T, D]
     o = torch.matmul(w, v)
 
     return o, w
-
-
-def backward_reference(q, k, v, o, attn_weights, do):
-    """
-    attention机制的反向传播参考实现（包含RoPE）
-    q, k, v: 输入的query, key, value（原始值，未经RoPE变换）
-    o: 前向传播的输出
-    attn_weights: attention权重矩阵
-    do: 输出的梯度
-    """
-    # 应用RoPE变换
-    seq_len = q.shape[2]
-    head_dim = q.shape[3]
-    cos, sin = precompute_rope_freqs(seq_len, head_dim, device=q.device)
-    q_rope = apply_rope_torch(q, cos, sin)
-    k_rope = apply_rope_torch(k, cos, sin)
-
-    # 计算dv: 通过attention weights反向传播
-    dv = torch.matmul(attn_weights.transpose(-2, -1), do)
-
-    # 计算d_attn_weights: 通过v反向传播
-    d_attn_weights = torch.matmul(do, v.transpose(-2, -1))
-
-    # 通过softmax反向传播
-    d_scores = attn_weights * (
-        d_attn_weights - (d_attn_weights * attn_weights).sum(dim=-1, keepdim=True)
-    )
-
-    # 通过缩放反向传播
-    scale = 1.0 / math.sqrt(q.shape[-1])
-    d_scores = d_scores * scale
-
-    # 计算dq_rope和dk_rope（相对于RoPE变换后的q和k）
-    dq_rope = torch.matmul(d_scores, k_rope)
-    dk_rope = torch.matmul(d_scores.transpose(-2, -1), q_rope)
-
-    # 应用RoPE逆变换到梯度
-    from rope_utils import apply_rope_inverse_torch
-
-    dq = apply_rope_inverse_torch(dq_rope, cos, sin)
-    dk = apply_rope_inverse_torch(dk_rope, cos, sin)
-
-    return dq, dk, dv
-
 
 if __name__ == "__main__":
     print("测试Fused RoPE + Attention Triton kernel...")
@@ -142,8 +108,8 @@ if __name__ == "__main__":
     # 设置参数
     batch_size = 1
     num_heads = 1
-    seq_len = 512
-    head_dim = 64
+    seq_len = 4
+    head_dim = 4
 
     device = "cuda"
 
@@ -167,14 +133,27 @@ if __name__ == "__main__":
     saved, o_triton = co_rope_forward(q, k, v, sm_scale=sm_scale)
     dq, dk, dv = co_rope_backward(saved, do, sm_scale)
 
-    # # 参考实现
-    o_ref, attn_weights = forward_reference(q, k, v, sm_scale=sm_scale)
-    # dq_ref, dk_ref, dv_ref = backward_reference(q, k, v, o_ref, attn_weights, do)
+    # 参考实现 - 使用torch自动梯度
+    # 需要重新创建输入张量以确保梯度计算正确
+    q_ref = q.clone().detach().requires_grad_(True)
+    k_ref = k.clone().detach().requires_grad_(True)
+    v_ref = v.clone().detach().requires_grad_(True)
+    
+    o_ref, attn_weights = forward_reference(q_ref, k_ref, v_ref, sm_scale=sm_scale)
+    
+    # 使用torch自动梯度计算反向传播
+    o_ref.backward(do)
+    dq_ref = q_ref.grad
+    dk_ref = k_ref.grad
+    dv_ref = v_ref.grad
+
+    print(dq)
+    print(dq_ref)
 
     # 正确性检验
     print("\n=== 正确性检验 ===")
     print(torch.any(torch.isnan(o_triton)), torch.any(torch.isnan(o_ref)))
     assert_similar(o_triton, o_ref, eps=1e-5, name="attention_output")
-    # assert_similar(dq, dq_ref, eps=1e-5, name="dq")
-    # assert_similar(dk, dk_ref, eps=1e-5, name="dk")
-    # assert_similar(dv, dv_ref, eps=1e-5, name="dv")
+    assert_similar(dq, dq_ref, eps=1e-5, name="dq")
+    assert_similar(dk, dk_ref, eps=1e-5, name="dk")
+    assert_similar(dv, dv_ref, eps=1e-5, name="dv")
