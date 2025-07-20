@@ -5,20 +5,8 @@ import triton.language as tl
 
 @triton.jit
 def co_rope_mqa_fwd_kernel(
-    Q,
-    K,
-    V,
-    O,
-    M,
-    L,
-    A,
-    thetas,
-    contextual_bias,
-    stride_batch,
-    stride_head,
-    stride_seq,
-    stride_dim,
-    stride_a,
+    Q, K, V, O, M, L, A, thetas, contextual_bias,
+    stride_batch, stride_head, stride_seq, stride_dim, stride_a,
     seq_len,
     SM_SCALE: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -31,12 +19,9 @@ def co_rope_mqa_fwd_kernel(
     m_idx = tl.program_id(axis=0)
     batch_head_idx = tl.program_id(axis=1)
 
-    # MQA: K和V在所有头之间共享，只有Q是独立的
+    # MQA: 只 batch 偏移
     qkv_offset = batch_head_idx.to(tl.int64) * stride_head
     Q_base = Q + qkv_offset
-    
-    # K和V的偏移量 - 在MQA中，所有头共享相同的K和V
-    # 只需要batch偏移，不需要head偏移
     batch_idx = batch_head_idx // NUM_HEADS
     K_base = K + batch_idx.to(tl.int64) * stride_batch
     V_base = V + batch_idx.to(tl.int64) * stride_batch
@@ -45,87 +30,69 @@ def co_rope_mqa_fwd_kernel(
     offs_m = m_idx * BLOCK_M + tl.arange(0, BLOCK_M)
     mask_m = offs_m < seq_len
 
-    # [D]
     thetas = tl.load(thetas + tl.arange(0, HEAD_DIM)).to(tl.float32)
-    swap_offsets = ((tl.arange(0, HEAD_DIM) + 1) % 2) * 2 - 1  # 1, 0, 3, 2, 5, 4, ...
+    swap_offsets = ((tl.arange(0, HEAD_DIM) + 1) % 2) * 2 - 1
 
-    # [M, D]
+    # [M, D]，BLOCK_M=1
     q_ptrs = Q_base + offs_m[:, None] * stride_seq + tl.arange(0, HEAD_DIM)[None, :]
-    q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
-    q_swap = tl.load(q_ptrs + swap_offsets[None, :], mask=mask_m[:, None], other=0.0).to(tl.float32)
+    q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)  # [1, D]
+    q_swap = tl.load(q_ptrs + swap_offsets[None, :], mask=mask_m[:, None], other=0.0).to(tl.float32)  # [1, D]
+    q = tl.reshape(q, [HEAD_DIM])         # [D]
+    q_swap = tl.reshape(q_swap, [HEAD_DIM])  # [D]
 
-    o_acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-    l_acc = tl.zeros([BLOCK_M], dtype=tl.float32)
-    m_acc = tl.full([BLOCK_M], -1e9, dtype=tl.float32)
-    a_acc = tl.zeros([BLOCK_M], dtype=tl.float32)
+    o_acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
+    l_acc = tl.zeros([], dtype=tl.float32)
+    m_acc = tl.full([], -1e9, dtype=tl.float32)
+    a_acc = tl.zeros([], dtype=tl.float32)
 
     LAST_BLOCK_START = (m_idx // BLOCK_N) * BLOCK_N
     for start_n in tl.range(LAST_BLOCK_START, -1, -BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
-
-        # [N]
         offs_n = start_n + tl.arange(0, BLOCK_N)
         mask_n = offs_n <= m_idx
 
-        # [N, D] - 加载K（共享的）
+        # [N, D]
         k_ptrs = K_base + offs_n[:, None] * stride_seq + tl.arange(0, HEAD_DIM)[None, :]
-        k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0).to(tl.float32)
+        k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0).to(tl.float32)  # [N, D]
 
-        # [N]
-        z = tl.sigmoid(tl.sum(q * k, axis=1))
-        z = tl.where(offs_n <= m_idx, z, 0)
-        # [N]
+        z = tl.sigmoid(tl.sum(q * k, axis=1))  # [N]
+        z = tl.where(mask_n, z, 0)
         zc = tl.cumsum(z)
         zs = tl.sum(z)
         a = a_acc + zs - zc
+        a_acc = a_acc + zs
 
-        # [M]
-        a_acc = a_acc + zs # a[0, :]
-
-        # [N, D] = [N, 1] [1, D]
         freqs = a[:, None] * thetas[None, :]
         freqs_cos = tl.cos(freqs)
         freqs_sin = tl.sin(freqs) * tl.where(tl.arange(0, HEAD_DIM) % 2 == 0, -1, 1)
-
-        # [N, D]
         rot_q = freqs_cos * q + freqs_sin * q_swap
 
-        # [N]
-        logits = tl.where(offs_n <= m_idx, tl.sum(rot_q * k, axis=1) * SM_SCALE, CAUSAL_MASK_VALUE)
-        
+        logits = tl.where(mask_n, tl.sum(rot_q * k, axis=1) * SM_SCALE, CAUSAL_MASK_VALUE)
+
         # 添加contextual bias
-        bias_ptrs = contextual_bias + offs_m[:, None] * seq_len + offs_n[None, :]
-        bias = tl.load(bias_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0).to(tl.float32)
+        bias_ptrs = contextual_bias + offs_m * seq_len + offs_n
+        bias = tl.load(bias_ptrs, mask=mask_n, other=0.0).to(tl.float32)
         logits = logits + bias
 
-        # [N, D] - 加载V（共享的）
         v_ptrs = V_base + offs_n[:, None] * stride_seq + tl.arange(0, HEAD_DIM)[None, :]
         v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0).to(tl.float32)
 
-        # [M]
         m_new = tl.maximum(m_acc, tl.max(logits))
-        # [M]
         alpha = tl.exp(m_acc - m_new)
-        # [N]
         p = tl.exp(logits - m_new)
 
-        # [M, D] - 使用循环来避免维度问题
-        for i in range(BLOCK_M):
-            for j in range(HEAD_DIM):
-                weighted_sum = 0.0
-                for n in range(BLOCK_N):
-                    if mask_n[n]:
-                        weighted_sum += p[n] * v[n, j]
-                o_acc[i, j] = o_acc[i, j] * alpha[i] + weighted_sum
-        
-        l_acc = l_acc * alpha + tl.sum(p)
+        # 只保留有效token
+        # mask_n: [BLOCK_N]，p: [BLOCK_N]，v: [BLOCK_N, HEAD_DIM]
+        p_masked = tl.where(mask_n, p, 0.0)           # [BLOCK_N]
+        v_masked = tl.where(mask_n[:, None], v, 0.0)  # [BLOCK_N, HEAD_DIM]
+        o_acc = o_acc * alpha + tl.sum(p_masked[:, None] * v_masked, axis=0)
+        l_acc = l_acc * alpha + tl.sum(p_masked)
         m_acc = m_new
 
-    # [M, D]
-    o_acc = o_acc / l_acc[:, None]
+    o_acc = o_acc / l_acc
 
-    o_ptrs = O_base + offs_m[:, None] * stride_seq + tl.arange(0, HEAD_DIM)[None, :]
-    tl.store(o_ptrs, o_acc.to(O.dtype.element_ty), mask=mask_m[:, None])
+    o_ptrs = O_base + offs_m * stride_seq + tl.arange(0, HEAD_DIM)
+    tl.store(o_ptrs, o_acc, mask=mask_m)
 
     m_ptrs = M + batch_head_idx * seq_len + offs_m
     tl.store(m_ptrs, m_acc, mask=mask_m)
